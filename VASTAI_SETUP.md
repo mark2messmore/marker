@@ -5,18 +5,21 @@ This guide helps you run Marker on vast.ai for fast PDF-to-markdown conversion.
 ## Recommended Instance
 
 - **GPU**: RTX 3090, RTX 4090, A100, or H100 (8GB+ VRAM minimum)
-- **Image**: `pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime` or any PyTorch CUDA image
+- **Image** (pick one):
+  - `vastai/pytorch` - Vast.ai's official PyTorch image (recommended)
+  - `nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04` - NVIDIA CUDA base
+  - Or any template with "PyTorch" in the name from vast.ai's template list
 - **Disk**: 20GB+ (models are ~5GB)
 
 ## Quick Start
 
 ### Option 1: Direct Setup (Recommended)
 
-1. **Create a vast.ai instance** with a PyTorch CUDA image
+1. **Create a vast.ai instance** - Select `vastai/pytorch` or any PyTorch template
 
 2. **Clone and setup**:
 ```bash
-git clone https://github.com/datalab-to/marker.git
+git clone https://github.com/mark2messmore/marker.git
 cd marker
 chmod +x setup_vastai.sh
 ./setup_vastai.sh
@@ -35,7 +38,7 @@ marker_single /path/to/your.pdf --output_dir ./output
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 # Clone and install marker
-git clone https://github.com/datalab-to/marker.git
+git clone https://github.com/mark2messmore/marker.git
 cd marker
 pip install -e .
 
