@@ -1,0 +1,31 @@
+# Dockerfile for Marker PDF with GPU support
+# Use with: docker build -f Dockerfile.gpu -t marker-gpu .
+# Run with: docker run --gpus all -v /path/to/pdfs:/data marker-gpu marker_single /data/file.pdf
+
+FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy project files
+COPY . /app/
+
+# Install marker
+RUN pip install --no-cache-dir -e .
+
+# Set environment for CUDA
+ENV TORCH_DEVICE=cuda
+
+# Verify installation
+RUN python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+RUN python -c "from marker.converters.pdf import PdfConverter; print('Marker OK')"
+
+# Default command
+ENTRYPOINT ["marker_single"]
+CMD ["--help"]
