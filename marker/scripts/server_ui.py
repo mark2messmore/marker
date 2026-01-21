@@ -322,8 +322,9 @@ async def process_job(job: dict):
         )
 
         # Configure conversion for this chunk
+        # Note: Don't pass page_range to ConfigParser - it expects a string
+        # We set it directly in config_dict as a list
         options = {
-            "page_range": page_range,
             "force_ocr": job["force_ocr"],
             "paginate_output": job["paginate_output"],
             "output_format": "markdown"
@@ -332,6 +333,7 @@ async def process_job(job: dict):
         config_parser = ConfigParser(options)
         config_dict = config_parser.generate_config_dict()
         config_dict["pdftext_workers"] = 1
+        config_dict["page_range"] = page_range  # Set page_range directly as list
 
         converter = PdfConverter(
             config=config_dict,
