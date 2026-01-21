@@ -59,27 +59,36 @@ queue_state = {
 }
 
 
+def get_table_columns(conn, table_name: str) -> set:
+    """Get existing column names for a table."""
+    c = conn.cursor()
+    c.execute(f"PRAGMA table_info({table_name})")
+    return {row[1] for row in c.fetchall()}
+
+
+def add_column_if_missing(conn, table_name: str, column_name: str, column_def: str):
+    """Add a column to a table if it doesn't exist."""
+    existing_columns = get_table_columns(conn, table_name)
+    if column_name not in existing_columns:
+        c = conn.cursor()
+        c.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+        print(f"  Added column '{column_name}' to '{table_name}'")
+
+
 def init_db():
-    """Initialize SQLite database."""
+    """Initialize SQLite database with migration support."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
+    print("Initializing database...")
+
+    # Create tables if they don't exist
     c.execute('''
         CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY,
             filename TEXT NOT NULL,
-            file_size INTEGER DEFAULT 0,
             status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            completed_at TEXT,
-            has_markdown INTEGER DEFAULT 0,
-            has_json INTEGER DEFAULT 0,
-            has_images INTEGER DEFAULT 0,
-            error_message TEXT,
-            total_chunks INTEGER DEFAULT 1,
-            current_chunk INTEGER DEFAULT 0,
-            percent INTEGER DEFAULT 0,
-            message TEXT
+            created_at TEXT NOT NULL
         )
     ''')
 
@@ -94,20 +103,49 @@ def init_db():
         CREATE TABLE IF NOT EXISTS queue (
             id TEXT PRIMARY KEY,
             filename TEXT NOT NULL,
-            file_size INTEGER DEFAULT 0,
             filepath TEXT NOT NULL,
-            output_markdown INTEGER DEFAULT 1,
-            output_json INTEGER DEFAULT 0,
-            output_images INTEGER DEFAULT 1,
-            force_ocr INTEGER DEFAULT 0,
-            paginate_output INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            position INTEGER DEFAULT 0
+            created_at TEXT NOT NULL
         )
     ''')
 
     conn.commit()
+
+    # Migrate: Add missing columns to 'jobs' table
+    print("Checking for schema migrations...")
+
+    jobs_migrations = [
+        ("file_size", "INTEGER DEFAULT 0"),
+        ("completed_at", "TEXT"),
+        ("has_markdown", "INTEGER DEFAULT 0"),
+        ("has_json", "INTEGER DEFAULT 0"),
+        ("has_images", "INTEGER DEFAULT 0"),
+        ("error_message", "TEXT"),
+        ("total_chunks", "INTEGER DEFAULT 1"),
+        ("current_chunk", "INTEGER DEFAULT 0"),
+        ("percent", "INTEGER DEFAULT 0"),
+        ("message", "TEXT"),
+    ]
+
+    for col_name, col_def in jobs_migrations:
+        add_column_if_missing(conn, "jobs", col_name, col_def)
+
+    # Migrate: Add missing columns to 'queue' table
+    queue_migrations = [
+        ("file_size", "INTEGER DEFAULT 0"),
+        ("output_markdown", "INTEGER DEFAULT 1"),
+        ("output_json", "INTEGER DEFAULT 0"),
+        ("output_images", "INTEGER DEFAULT 1"),
+        ("force_ocr", "INTEGER DEFAULT 0"),
+        ("paginate_output", "INTEGER DEFAULT 0"),
+        ("position", "INTEGER DEFAULT 0"),
+    ]
+
+    for col_name, col_def in queue_migrations:
+        add_column_if_missing(conn, "queue", col_name, col_def)
+
+    conn.commit()
     conn.close()
+    print("Database ready!")
 
 
 def get_db():
