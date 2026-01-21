@@ -8,6 +8,15 @@
 	let history = [];
 	let eventSource = null;
 
+	// Upload progress tracking
+	let uploadingFiles = []; // { file, progress, status: 'pending'|'uploading'|'complete'|'error' }
+	let isUploading = false;
+
+	// Toast notification
+	let toastMessage = '';
+	let toastVisible = false;
+	let toastTimeout = null;
+
 	// Settings (persisted)
 	let settings = {
 		outputMarkdown: true,
@@ -127,14 +136,21 @@
 		selectedFiles = selectedFiles.filter((_, i) => i !== index);
 	}
 
-	async function addToQueue() {
-		if (selectedFiles.length === 0) return;
+	function showToast(message, duration = 4000) {
+		if (toastTimeout) {
+			clearTimeout(toastTimeout);
+		}
+		toastMessage = message;
+		toastVisible = true;
+		toastTimeout = setTimeout(() => {
+			toastVisible = false;
+			toastMessage = '';
+		}, duration);
+	}
 
-		// Save settings first
-		await saveSettings();
-
-		// Upload each file to queue
-		for (const file of selectedFiles) {
+	function uploadFileWithProgress(file, index) {
+		return new Promise((resolve, reject) => {
+			const xhr = new XMLHttpRequest();
 			const formData = new FormData();
 			formData.append('file', file);
 			formData.append('output_markdown', settings.outputMarkdown);
@@ -143,24 +159,78 @@
 			formData.append('force_ocr', settings.forceOcr);
 			formData.append('paginate_output', settings.paginateOutput);
 
-			try {
-				const res = await fetch('/api/queue/add', {
-					method: 'POST',
-					body: formData
-				});
-
-				if (!res.ok) {
-					const error = await res.json();
-					console.error('Failed to add to queue:', error);
+			xhr.upload.onprogress = (event) => {
+				if (event.lengthComputable) {
+					const percent = Math.round((event.loaded / event.total) * 100);
+					uploadingFiles = uploadingFiles.map((f, i) =>
+						i === index ? { ...f, progress: percent, status: 'uploading' } : f
+					);
 				}
+			};
+
+			xhr.onload = () => {
+				if (xhr.status >= 200 && xhr.status < 300) {
+					uploadingFiles = uploadingFiles.map((f, i) =>
+						i === index ? { ...f, progress: 100, status: 'complete' } : f
+					);
+					resolve();
+				} else {
+					uploadingFiles = uploadingFiles.map((f, i) =>
+						i === index ? { ...f, status: 'error' } : f
+					);
+					reject(new Error(`Upload failed: ${xhr.status}`));
+				}
+			};
+
+			xhr.onerror = () => {
+				uploadingFiles = uploadingFiles.map((f, i) =>
+					i === index ? { ...f, status: 'error' } : f
+				);
+				reject(new Error('Network error'));
+			};
+
+			xhr.open('POST', '/api/queue/add');
+			xhr.send(formData);
+		});
+	}
+
+	async function addToQueue() {
+		if (selectedFiles.length === 0) return;
+
+		// Save settings first
+		await saveSettings();
+
+		// Initialize upload tracking
+		isUploading = true;
+		uploadingFiles = selectedFiles.map(file => ({
+			file,
+			progress: 0,
+			status: 'pending'
+		}));
+
+		const fileCount = selectedFiles.length;
+		let successCount = 0;
+
+		// Upload files sequentially with progress tracking
+		for (let i = 0; i < uploadingFiles.length; i++) {
+			try {
+				await uploadFileWithProgress(uploadingFiles[i].file, i);
+				successCount++;
 			} catch (e) {
-				console.error('Network error adding to queue:', e);
+				console.error('Failed to upload:', uploadingFiles[i].file.name, e);
 			}
 		}
 
-		// Clear selected files and switch to queue tab
+		// Clear state and show notification
 		selectedFiles = [];
-		activeTab = 'queue';
+		uploadingFiles = [];
+		isUploading = false;
+
+		// Show toast notification - stay on Convert tab
+		if (successCount > 0) {
+			showToast(`${successCount} file${successCount > 1 ? 's' : ''} added to queue`);
+		}
+
 		await loadQueue();
 	}
 
@@ -228,49 +298,97 @@
 	{#if activeTab === 'convert'}
 		<div class="convert-section">
 			<!-- Upload Area -->
-			<div
-				class="upload-area card"
-				class:dragging={isDragging}
-				class:has-file={selectedFiles.length > 0}
-				ondragover={(e) => { e.preventDefault(); isDragging = true; }}
-				ondragleave={() => isDragging = false}
-				ondrop={handleDrop}
-				onclick={() => document.getElementById('file-input').click()}
-				role="button"
-				tabindex="0"
-				onkeydown={(e) => e.key === 'Enter' && document.getElementById('file-input').click()}
-			>
-				<input
-					type="file"
-					id="file-input"
-					accept=".pdf,application/pdf"
-					multiple
-					onchange={handleFileSelect}
-				/>
-
-				{#if selectedFiles.length > 0}
-					<div class="selected-files" onclick={(e) => e.stopPropagation()}>
-						<p class="selected-count">{selectedFiles.length} file{selectedFiles.length > 1 ? 's' : ''} selected</p>
+			{#if isUploading}
+				<!-- Show upload progress -->
+				<div class="upload-area card uploading">
+					<div class="selected-files">
+						<p class="selected-count">Uploading {uploadingFiles.length} file{uploadingFiles.length > 1 ? 's' : ''}...</p>
 						<div class="file-list">
-							{#each selectedFiles as file, index}
-								<div class="file-item">
-									<span class="file-icon">&#128196;</span>
-									<span class="file-name">{file.name}</span>
-									<span class="file-size">{formatFileSize(file.size)}</span>
-									<button class="remove-btn" onclick={() => removeFile(index)}>&#10005;</button>
+							{#each uploadingFiles as upload, index}
+								<div class="file-item uploading-item">
+									<span class="file-icon">
+										{#if upload.status === 'complete'}
+											&#10003;
+										{:else if upload.status === 'error'}
+											&#10007;
+										{:else if upload.status === 'uploading'}
+											&#8635;
+										{:else}
+											&#128196;
+										{/if}
+									</span>
+									<div class="file-info">
+										<span class="file-name">{upload.file.name}</span>
+										<div class="upload-progress-bar">
+											<div
+												class="upload-progress-fill"
+												class:complete={upload.status === 'complete'}
+												class:error={upload.status === 'error'}
+												style="width: {upload.progress}%"
+											></div>
+										</div>
+									</div>
+									<span class="upload-percent">
+										{#if upload.status === 'complete'}
+											Done
+										{:else if upload.status === 'error'}
+											Error
+										{:else if upload.status === 'pending'}
+											Waiting
+										{:else}
+											{upload.progress}%
+										{/if}
+									</span>
 								</div>
 							{/each}
 						</div>
-						<p class="add-more">Click or drop to add more files</p>
 					</div>
-				{:else}
-					<div class="upload-prompt">
-						<span class="upload-icon">&#128194;</span>
-						<p>Drop PDFs here or click to browse</p>
-						<p class="upload-hint">You can select multiple files</p>
-					</div>
-				{/if}
-			</div>
+				</div>
+			{:else}
+				<div
+					class="upload-area card"
+					class:dragging={isDragging}
+					class:has-file={selectedFiles.length > 0}
+					ondragover={(e) => { e.preventDefault(); isDragging = true; }}
+					ondragleave={() => isDragging = false}
+					ondrop={handleDrop}
+					onclick={() => document.getElementById('file-input').click()}
+					role="button"
+					tabindex="0"
+					onkeydown={(e) => e.key === 'Enter' && document.getElementById('file-input').click()}
+				>
+					<input
+						type="file"
+						id="file-input"
+						accept=".pdf,application/pdf"
+						multiple
+						onchange={handleFileSelect}
+					/>
+
+					{#if selectedFiles.length > 0}
+						<div class="selected-files" onclick={(e) => e.stopPropagation()}>
+							<p class="selected-count">{selectedFiles.length} file{selectedFiles.length > 1 ? 's' : ''} selected</p>
+							<div class="file-list">
+								{#each selectedFiles as file, index}
+									<div class="file-item">
+										<span class="file-icon">&#128196;</span>
+										<span class="file-name">{file.name}</span>
+										<span class="file-size">{formatFileSize(file.size)}</span>
+										<button class="remove-btn" onclick={() => removeFile(index)}>&#10005;</button>
+									</div>
+								{/each}
+							</div>
+							<p class="add-more">Click or drop to add more files</p>
+						</div>
+					{:else}
+						<div class="upload-prompt">
+							<span class="upload-icon">&#128194;</span>
+							<p>Drop PDFs here or click to browse</p>
+							<p class="upload-hint">You can select multiple files</p>
+						</div>
+					{/if}
+				</div>
+			{/if}
 
 			<!-- Output Options -->
 			<div class="options card">
@@ -307,9 +425,13 @@
 			<button
 				class="convert-btn primary"
 				onclick={addToQueue}
-				disabled={selectedFiles.length === 0}
+				disabled={selectedFiles.length === 0 || isUploading}
 			>
-				Add to Queue ({selectedFiles.length} file{selectedFiles.length !== 1 ? 's' : ''})
+				{#if isUploading}
+					Uploading...
+				{:else}
+					Add to Queue ({selectedFiles.length} file{selectedFiles.length !== 1 ? 's' : ''})
+				{/if}
 			</button>
 		</div>
 
@@ -405,6 +527,14 @@
 					{/each}
 				</div>
 			{/if}
+		</div>
+	{/if}
+
+	<!-- Toast Notification -->
+	{#if toastVisible}
+		<div class="toast" class:visible={toastVisible}>
+			<span class="toast-icon">&#10003;</span>
+			{toastMessage}
 		</div>
 	{/if}
 </main>
@@ -745,5 +875,88 @@
 	.empty-hint {
 		font-size: 14px;
 		margin-top: 8px;
+	}
+
+	/* Upload progress styles */
+	.upload-area.uploading {
+		border-style: solid;
+		border-color: var(--accent);
+		cursor: default;
+	}
+
+	.uploading-item {
+		flex-wrap: wrap;
+	}
+
+	.uploading-item .file-icon {
+		width: 24px;
+		text-align: center;
+	}
+
+	.uploading-item .file-info {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.uploading-item .file-name {
+		display: block;
+		margin-bottom: 6px;
+	}
+
+	.upload-progress-bar {
+		height: 4px;
+		background: var(--bg-tertiary);
+		border-radius: 2px;
+		overflow: hidden;
+	}
+
+	.upload-progress-fill {
+		height: 100%;
+		background: var(--accent);
+		transition: width 0.15s ease;
+	}
+
+	.upload-progress-fill.complete {
+		background: var(--success);
+	}
+
+	.upload-progress-fill.error {
+		background: var(--error);
+	}
+
+	.upload-percent {
+		font-size: 12px;
+		color: var(--text-secondary);
+		width: 50px;
+		text-align: right;
+	}
+
+	/* Toast notification */
+	.toast {
+		position: fixed;
+		bottom: 24px;
+		left: 50%;
+		transform: translateX(-50%) translateY(100px);
+		background: var(--success);
+		color: white;
+		padding: 12px 24px;
+		border-radius: 8px;
+		font-weight: 500;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+		opacity: 0;
+		transition: transform 0.3s ease, opacity 0.3s ease;
+		z-index: 1000;
+	}
+
+	.toast.visible {
+		transform: translateX(-50%) translateY(0);
+		opacity: 1;
+	}
+
+	.toast-icon {
+		font-size: 18px;
 	}
 </style>
