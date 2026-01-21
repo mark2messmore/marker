@@ -1,13 +1,11 @@
 <script>
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 
 	let activeTab = 'convert';
-	let files = [];
+	let selectedFiles = [];
 	let isDragging = false;
-	let isConverting = false;
-	let progress = { status: 'idle', message: '', percent: 0 };
+	let queue = [];
 	let history = [];
-	let currentJobId = null;
 	let eventSource = null;
 
 	// Settings (persisted)
@@ -31,9 +29,30 @@
 			console.log('Using default settings');
 		}
 
-		// Load history
+		// Load queue and history
+		await loadQueue();
 		await loadHistory();
+
+		// Start listening to queue updates
+		connectQueueSSE();
 	});
+
+	onDestroy(() => {
+		if (eventSource) {
+			eventSource.close();
+		}
+	});
+
+	async function loadQueue() {
+		try {
+			const res = await fetch('/api/queue');
+			if (res.ok) {
+				queue = await res.json();
+			}
+		} catch (e) {
+			console.error('Failed to load queue:', e);
+		}
+	}
 
 	async function loadHistory() {
 		try {
@@ -44,6 +63,35 @@
 		} catch (e) {
 			console.error('Failed to load history:', e);
 		}
+	}
+
+	function connectQueueSSE() {
+		if (eventSource) {
+			eventSource.close();
+		}
+
+		eventSource = new EventSource('/api/queue/stream');
+
+		eventSource.onmessage = (event) => {
+			const data = JSON.parse(event.data);
+
+			if (data.type === 'queue_update') {
+				queue = data.queue;
+			} else if (data.type === 'job_complete') {
+				loadHistory();
+				loadQueue();
+			}
+		};
+
+		eventSource.onerror = () => {
+			// Reconnect after 2 seconds
+			setTimeout(() => {
+				if (eventSource) {
+					eventSource.close();
+				}
+				connectQueueSSE();
+			}, 2000);
+		};
 	}
 
 	async function saveSettings() {
@@ -65,78 +113,64 @@
 			f => f.type === 'application/pdf' || f.name.endsWith('.pdf')
 		);
 		if (droppedFiles.length > 0) {
-			files = droppedFiles;
+			selectedFiles = [...selectedFiles, ...droppedFiles];
 		}
 	}
 
 	function handleFileSelect(e) {
-		files = Array.from(e.target.files);
+		const newFiles = Array.from(e.target.files);
+		selectedFiles = [...selectedFiles, ...newFiles];
+		e.target.value = ''; // Reset input so same file can be added again
 	}
 
-	function connectSSE(jobId) {
-		if (eventSource) {
-			eventSource.close();
+	function removeFile(index) {
+		selectedFiles = selectedFiles.filter((_, i) => i !== index);
+	}
+
+	async function addToQueue() {
+		if (selectedFiles.length === 0) return;
+
+		// Save settings first
+		await saveSettings();
+
+		// Upload each file to queue
+		for (const file of selectedFiles) {
+			const formData = new FormData();
+			formData.append('file', file);
+			formData.append('output_markdown', settings.outputMarkdown);
+			formData.append('output_json', settings.outputJson);
+			formData.append('output_images', settings.outputImages);
+			formData.append('force_ocr', settings.forceOcr);
+			formData.append('paginate_output', settings.paginateOutput);
+
+			try {
+				const res = await fetch('/api/queue/add', {
+					method: 'POST',
+					body: formData
+				});
+
+				if (!res.ok) {
+					const error = await res.json();
+					console.error('Failed to add to queue:', error);
+				}
+			} catch (e) {
+				console.error('Network error adding to queue:', e);
+			}
 		}
 
-		eventSource = new EventSource(`/api/progress/${jobId}`);
-
-		eventSource.onmessage = (event) => {
-			const data = JSON.parse(event.data);
-			progress = data;
-
-			if (data.status === 'complete' || data.status === 'error') {
-				eventSource.close();
-				eventSource = null;
-				isConverting = false;
-				loadHistory();
-			}
-		};
-
-		eventSource.onerror = () => {
-			eventSource.close();
-			eventSource = null;
-			isConverting = false;
-			progress = { status: 'error', message: 'Connection lost', percent: 0 };
-		};
+		// Clear selected files and switch to queue tab
+		selectedFiles = [];
+		activeTab = 'queue';
+		await loadQueue();
 	}
 
-	async function startConversion() {
-		if (files.length === 0 || isConverting) return;
-
-		isConverting = true;
-		progress = { status: 'uploading', message: 'Uploading file...', percent: 0 };
-
-		const formData = new FormData();
-		formData.append('file', files[0]);
-		formData.append('output_markdown', settings.outputMarkdown);
-		formData.append('output_json', settings.outputJson);
-		formData.append('output_images', settings.outputImages);
-		formData.append('force_ocr', settings.forceOcr);
-		formData.append('paginate_output', settings.paginateOutput);
-
+	async function removeFromQueue(jobId) {
 		try {
-			const res = await fetch('/api/convert', {
-				method: 'POST',
-				body: formData
-			});
-
-			if (res.ok) {
-				const data = await res.json();
-				currentJobId = data.job_id;
-				progress = { status: 'processing', message: 'Starting conversion...', percent: 5 };
-				connectSSE(currentJobId);
-			} else {
-				const error = await res.json();
-				progress = { status: 'error', message: error.detail || 'Upload failed', percent: 0 };
-				isConverting = false;
-			}
+			await fetch(`/api/queue/${jobId}`, { method: 'DELETE' });
+			await loadQueue();
 		} catch (e) {
-			progress = { status: 'error', message: 'Network error', percent: 0 };
-			isConverting = false;
+			console.error('Failed to remove from queue:', e);
 		}
-
-		// Save settings after conversion starts
-		saveSettings();
 	}
 
 	function formatDate(dateStr) {
@@ -155,8 +189,21 @@
 			case 'complete': return 'var(--success)';
 			case 'error': return 'var(--error)';
 			case 'processing': return 'var(--warning)';
+			case 'queued': return 'var(--text-secondary)';
 			default: return 'var(--text-secondary)';
 		}
+	}
+
+	function getProgressMessage(job) {
+		if (job.status === 'queued') return 'Waiting in queue...';
+		if (job.status === 'processing') {
+			if (job.total_chunks > 1) {
+				return `Processing chunk ${job.current_chunk}/${job.total_chunks}: ${job.message || ''}`;
+			}
+			return job.message || 'Processing...';
+		}
+		if (job.status === 'merging') return 'Merging chunks...';
+		return job.message || '';
 	}
 </script>
 
@@ -170,6 +217,9 @@
 		<button class="tab" class:active={activeTab === 'convert'} onclick={() => activeTab = 'convert'}>
 			Convert
 		</button>
+		<button class="tab" class:active={activeTab === 'queue'} onclick={() => activeTab = 'queue'}>
+			Queue {#if queue.length > 0}<span class="badge">{queue.length}</span>{/if}
+		</button>
 		<button class="tab" class:active={activeTab === 'history'} onclick={() => activeTab = 'history'}>
 			History
 		</button>
@@ -181,31 +231,43 @@
 			<div
 				class="upload-area card"
 				class:dragging={isDragging}
-				class:has-file={files.length > 0}
+				class:has-file={selectedFiles.length > 0}
 				ondragover={(e) => { e.preventDefault(); isDragging = true; }}
 				ondragleave={() => isDragging = false}
 				ondrop={handleDrop}
 				onclick={() => document.getElementById('file-input').click()}
 				role="button"
 				tabindex="0"
+				onkeydown={(e) => e.key === 'Enter' && document.getElementById('file-input').click()}
 			>
 				<input
 					type="file"
 					id="file-input"
 					accept=".pdf,application/pdf"
+					multiple
 					onchange={handleFileSelect}
 				/>
 
-				{#if files.length > 0}
-					<div class="file-info">
-						<span class="file-icon">&#128196;</span>
-						<span class="file-name">{files[0].name}</span>
-						<span class="file-size">{formatFileSize(files[0].size)}</span>
+				{#if selectedFiles.length > 0}
+					<div class="selected-files" onclick={(e) => e.stopPropagation()}>
+						<p class="selected-count">{selectedFiles.length} file{selectedFiles.length > 1 ? 's' : ''} selected</p>
+						<div class="file-list">
+							{#each selectedFiles as file, index}
+								<div class="file-item">
+									<span class="file-icon">&#128196;</span>
+									<span class="file-name">{file.name}</span>
+									<span class="file-size">{formatFileSize(file.size)}</span>
+									<button class="remove-btn" onclick={() => removeFile(index)}>&#10005;</button>
+								</div>
+							{/each}
+						</div>
+						<p class="add-more">Click or drop to add more files</p>
 					</div>
 				{:else}
 					<div class="upload-prompt">
 						<span class="upload-icon">&#128194;</span>
-						<p>Drop PDF here or click to browse</p>
+						<p>Drop PDFs here or click to browse</p>
+						<p class="upload-hint">You can select multiple files</p>
 					</div>
 				{/if}
 			</div>
@@ -241,31 +303,63 @@
 				</div>
 			</div>
 
-			<!-- Progress -->
-			{#if isConverting || progress.status !== 'idle'}
-				<div class="progress-section card">
-					<div class="progress-header">
-						<span class="progress-status" style="color: {getStatusColor(progress.status)}">
-							{progress.status.charAt(0).toUpperCase() + progress.status.slice(1)}
-						</span>
-						<span class="progress-percent">{progress.percent}%</span>
-					</div>
-					<div class="progress-bar">
-						<div class="progress-fill" style="width: {progress.percent}%"></div>
-					</div>
-					<p class="progress-message">{progress.message}</p>
-				</div>
-			{/if}
-
-			<!-- Convert Button -->
+			<!-- Add to Queue Button -->
 			<button
 				class="convert-btn primary"
-				onclick={startConversion}
-				disabled={files.length === 0 || isConverting}
+				onclick={addToQueue}
+				disabled={selectedFiles.length === 0}
 			>
-				{isConverting ? 'Converting...' : 'Convert'}
+				Add to Queue ({selectedFiles.length} file{selectedFiles.length !== 1 ? 's' : ''})
 			</button>
 		</div>
+
+	{:else if activeTab === 'queue'}
+		<!-- Queue Tab -->
+		<div class="queue-section">
+			{#if queue.length === 0}
+				<div class="empty-state card">
+					<p>Queue is empty</p>
+					<p class="empty-hint">Add files from the Convert tab</p>
+				</div>
+			{:else}
+				<div class="queue-list">
+					{#each queue as job, index}
+						<div class="queue-item card" class:processing={job.status === 'processing'}>
+							<div class="queue-position">
+								{#if job.status === 'processing'}
+									<span class="processing-indicator"></span>
+								{:else}
+									<span class="position-number">{index + 1}</span>
+								{/if}
+							</div>
+							<div class="queue-content">
+								<div class="queue-main">
+									<span class="queue-filename">{job.filename}</span>
+									<span class="queue-size">{formatFileSize(job.file_size)}</span>
+								</div>
+								<div class="queue-progress">
+									<span class="queue-status" style="color: {getStatusColor(job.status)}">
+										{job.status === 'processing' ? 'Processing' : 'Queued'}
+									</span>
+									<span class="queue-message">{getProgressMessage(job)}</span>
+								</div>
+								{#if job.status === 'processing'}
+									<div class="progress-bar">
+										<div class="progress-fill" style="width: {job.percent || 0}%"></div>
+									</div>
+								{/if}
+							</div>
+							{#if job.status === 'queued'}
+								<button class="remove-queue-btn" onclick={() => removeFromQueue(job.id)}>
+									&#10005;
+								</button>
+							{/if}
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</div>
+
 	{:else}
 		<!-- History Tab -->
 		<div class="history-section">
@@ -303,6 +397,8 @@
 											</a>
 										{/if}
 									</div>
+								{:else if job.status === 'error'}
+									<span class="error-message">{job.error_message || 'Unknown error'}</span>
 								{/if}
 							</div>
 						</div>
@@ -334,8 +430,17 @@
 		color: var(--text-secondary);
 	}
 
+	.badge {
+		background: var(--accent);
+		color: white;
+		font-size: 12px;
+		padding: 2px 8px;
+		border-radius: 10px;
+		margin-left: 6px;
+	}
+
 	.upload-area {
-		padding: 60px 40px;
+		padding: 40px;
 		text-align: center;
 		cursor: pointer;
 		transition: all 0.2s;
@@ -352,6 +457,7 @@
 	.upload-area.has-file {
 		border-style: solid;
 		border-color: var(--success);
+		cursor: default;
 	}
 
 	.upload-icon {
@@ -360,24 +466,74 @@
 		margin-bottom: 16px;
 	}
 
-	.file-info {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 12px;
-	}
-
-	.file-icon {
-		font-size: 32px;
-	}
-
-	.file-name {
-		font-weight: 500;
-	}
-
-	.file-size {
+	.upload-hint {
 		color: var(--text-secondary);
 		font-size: 14px;
+		margin-top: 8px;
+	}
+
+	.selected-files {
+		text-align: left;
+	}
+
+	.selected-count {
+		font-weight: 600;
+		margin-bottom: 12px;
+		text-align: center;
+	}
+
+	.file-list {
+		max-height: 200px;
+		overflow-y: auto;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.file-item {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 8px 12px;
+		background: var(--bg-tertiary);
+		border-radius: 6px;
+	}
+
+	.file-item .file-icon {
+		font-size: 20px;
+	}
+
+	.file-item .file-name {
+		flex: 1;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.file-item .file-size {
+		color: var(--text-secondary);
+		font-size: 13px;
+	}
+
+	.remove-btn {
+		background: none;
+		border: none;
+		color: var(--text-secondary);
+		padding: 4px 8px;
+		cursor: pointer;
+		font-size: 14px;
+	}
+
+	.remove-btn:hover {
+		color: var(--error);
+	}
+
+	.add-more {
+		text-align: center;
+		color: var(--text-secondary);
+		font-size: 13px;
+		margin-top: 12px;
+		cursor: pointer;
 	}
 
 	.options {
@@ -392,25 +548,110 @@
 		letter-spacing: 0.5px;
 	}
 
-	.progress-section {
+	.convert-btn {
 		margin-top: 20px;
+		width: 100%;
+		padding: 16px;
+		font-size: 16px;
 	}
 
-	.progress-header {
+	/* Queue styles */
+	.queue-list {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+
+	.queue-item {
+		display: flex;
+		align-items: flex-start;
+		gap: 16px;
+		padding: 16px 20px;
+	}
+
+	.queue-item.processing {
+		border-color: var(--warning);
+	}
+
+	.queue-position {
+		width: 32px;
+		height: 32px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+	}
+
+	.position-number {
+		background: var(--bg-tertiary);
+		width: 28px;
+		height: 28px;
+		border-radius: 50%;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 14px;
+		color: var(--text-secondary);
+	}
+
+	.processing-indicator {
+		width: 12px;
+		height: 12px;
+		background: var(--warning);
+		border-radius: 50%;
+		animation: pulse 1.5s ease-in-out infinite;
+	}
+
+	@keyframes pulse {
+		0%, 100% { opacity: 1; transform: scale(1); }
+		50% { opacity: 0.5; transform: scale(1.1); }
+	}
+
+	.queue-content {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.queue-main {
 		display: flex;
 		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 4px;
+	}
+
+	.queue-filename {
+		font-weight: 500;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.queue-size {
+		color: var(--text-secondary);
+		font-size: 13px;
+		flex-shrink: 0;
+		margin-left: 12px;
+	}
+
+	.queue-progress {
+		display: flex;
+		gap: 8px;
+		font-size: 14px;
 		margin-bottom: 8px;
 	}
 
-	.progress-status {
+	.queue-status {
 		font-weight: 500;
-		text-transform: capitalize;
+	}
+
+	.queue-message {
+		color: var(--text-secondary);
 	}
 
 	.progress-bar {
-		height: 8px;
+		height: 6px;
 		background: var(--bg-tertiary);
-		border-radius: 4px;
+		border-radius: 3px;
 		overflow: hidden;
 	}
 
@@ -420,19 +661,20 @@
 		transition: width 0.3s ease;
 	}
 
-	.progress-message {
-		margin-top: 8px;
+	.remove-queue-btn {
+		background: none;
+		border: none;
 		color: var(--text-secondary);
-		font-size: 14px;
-	}
-
-	.convert-btn {
-		margin-top: 20px;
-		width: 100%;
-		padding: 16px;
+		padding: 8px;
+		cursor: pointer;
 		font-size: 16px;
 	}
 
+	.remove-queue-btn:hover {
+		color: var(--error);
+	}
+
+	/* History styles */
 	.history-list {
 		display: flex;
 		flex-direction: column;
@@ -489,9 +731,19 @@
 		background: var(--border);
 	}
 
+	.error-message {
+		color: var(--error);
+		font-size: 13px;
+	}
+
 	.empty-state {
 		text-align: center;
 		padding: 60px;
 		color: var(--text-secondary);
+	}
+
+	.empty-hint {
+		font-size: 14px;
+		margin-top: 8px;
 	}
 </style>
