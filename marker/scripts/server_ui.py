@@ -1,8 +1,9 @@
 """
 Enhanced Marker server with UI support.
-Features: Queue system, 2MB chunking, SSE progress, job history, persistent settings.
+Features: Queue system, page-based chunking, SSE progress, job history, persistent settings.
 """
 import asyncio
+import gc
 import json
 import os
 import sqlite3
@@ -15,6 +16,8 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+
+import torch
 
 import click
 import uvicorn
@@ -46,8 +49,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Constants
-MAX_CHUNK_SIZE_MB = 2  # Split PDFs larger than this into chunks
-MAX_CHUNK_SIZE_BYTES = MAX_CHUNK_SIZE_MB * 1024 * 1024
+MAX_PAGES_PER_CHUNK = 5  # Process 5 pages at a time to avoid GPU OOM
 
 # Global state
 app_data = {}
@@ -167,22 +169,20 @@ def get_pdf_info(filepath: str) -> dict:
     return {"page_count": page_count, "file_size": file_size}
 
 
-def calculate_chunks(page_count: int, file_size: int) -> List[List[int]]:
+def calculate_chunks(page_count: int, file_size: int = 0) -> List[List[int]]:
     """
-    Calculate page ranges for ~2MB chunks.
-    Returns list of page ranges, e.g. [[0,1,2,3], [4,5,6,7], ...]
+    Calculate page ranges for processing in small chunks.
+    Returns list of page ranges, e.g. [[0,1,2,3,4], [5,6,7,8,9], ...]
+
+    Uses fixed pages per chunk to avoid GPU OOM errors.
     """
-    if file_size <= MAX_CHUNK_SIZE_BYTES:
+    if page_count <= MAX_PAGES_PER_CHUNK:
         # Small file, process all at once
         return [list(range(page_count))]
 
-    # Estimate pages per chunk based on file size
-    # Assume pages are roughly equal size
-    pages_per_chunk = max(1, int((page_count * MAX_CHUNK_SIZE_BYTES) / file_size))
-
     chunks = []
-    for start in range(0, page_count, pages_per_chunk):
-        end = min(start + pages_per_chunk, page_count)
+    for start in range(0, page_count, MAX_PAGES_PER_CHUNK):
+        end = min(start + MAX_PAGES_PER_CHUNK, page_count)
         chunks.append(list(range(start, end)))
 
     return chunks
@@ -355,6 +355,15 @@ async def process_job(job: dict):
             "metadata": metadata,
             "page_range": page_range,
         })
+
+        # Clean up memory after each chunk to prevent OOM
+        del converter
+        del rendered
+        del config_parser
+        del config_dict
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         await update_job_progress(job, f"Chunk {chunk_idx + 1}/{total_chunks} complete", chunk_end_percent)
 
@@ -767,7 +776,7 @@ def server_ui_cli(port: int, host: str):
     print(f"\n{'='*50}")
     print(f"  Marker UI Server")
     print(f"  http://{host}:{port}")
-    print(f"  Max chunk size: {MAX_CHUNK_SIZE_MB}MB")
+    print(f"  Max pages per chunk: {MAX_PAGES_PER_CHUNK}")
     print(f"{'='*50}\n")
 
     uvicorn.run(app, host=host, port=port)
