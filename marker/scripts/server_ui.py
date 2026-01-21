@@ -372,8 +372,8 @@ async def process_job(job: dict):
 
     merged_text, merged_images, merged_metadata = merge_chunk_results(chunk_results)
 
-    # Save outputs
-    base_name = filepath.stem
+    # Save outputs - use original filename (without .pdf extension)
+    base_name = Path(job["filename"]).stem
     has_markdown = False
     has_json = False
     has_images = False
