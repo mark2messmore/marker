@@ -18,12 +18,15 @@ from typing import Optional
 
 import click
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
+
+# API Router with /api prefix
+api_router = APIRouter(prefix="/api")
 
 from marker.config.parser import ConfigParser
 from marker.converters.pdf import PdfConverter
@@ -118,7 +121,7 @@ class Settings(BaseModel):
 
 # --- Settings Endpoints ---
 
-@app.get("/settings")
+@api_router.get("/settings")
 async def get_settings():
     """Get saved settings."""
     conn = get_db()
@@ -131,7 +134,7 @@ async def get_settings():
     return settings_dict
 
 
-@app.post("/settings")
+@api_router.post("/settings")
 async def save_settings(settings: Settings):
     """Save settings."""
     conn = get_db()
@@ -150,7 +153,7 @@ async def save_settings(settings: Settings):
 
 # --- History Endpoints ---
 
-@app.get("/history")
+@api_router.get("/history")
 async def get_history():
     """Get conversion history."""
     conn = get_db()
@@ -299,7 +302,7 @@ async def convert_pdf_task(
             filepath.unlink()
 
 
-@app.post("/convert")
+@api_router.post("/convert")
 async def start_conversion(
     file: UploadFile = File(...),
     output_markdown: bool = Form(True),
@@ -352,7 +355,7 @@ async def start_conversion(
     return {"job_id": job_id}
 
 
-@app.get("/progress/{job_id}")
+@api_router.get("/progress/{job_id}")
 async def get_progress(job_id: str):
     """SSE endpoint for job progress."""
     async def event_generator():
@@ -375,7 +378,7 @@ async def get_progress(job_id: str):
 
 # --- Download Endpoints ---
 
-@app.get("/download/{job_id}/markdown")
+@api_router.get("/download/{job_id}/markdown")
 async def download_markdown(job_id: str):
     """Download markdown file."""
     job_dir = OUTPUT_DIR / job_id
@@ -391,7 +394,7 @@ async def download_markdown(job_id: str):
     )
 
 
-@app.get("/download/{job_id}/json")
+@api_router.get("/download/{job_id}/json")
 async def download_json(job_id: str):
     """Download JSON file."""
     job_dir = OUTPUT_DIR / job_id
@@ -407,7 +410,7 @@ async def download_json(job_id: str):
     )
 
 
-@app.get("/download/{job_id}/images")
+@api_router.get("/download/{job_id}/images")
 async def download_images(job_id: str):
     """Download images as ZIP."""
     images_dir = OUTPUT_DIR / job_id / "images"
@@ -437,6 +440,10 @@ async def download_images(job_id: str):
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+
+# Include API router
+app.include_router(api_router)
 
 
 # --- Static Files (serve built Svelte app) ---
