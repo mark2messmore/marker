@@ -34,6 +34,15 @@ from marker.models import create_model_dict
 from marker.output import text_from_rendered
 from marker.settings import settings as marker_settings
 
+# Google Drive integration (optional)
+try:
+    from marker.integrations.google_drive import init_poller, get_poller
+    GDRIVE_AVAILABLE = True
+except ImportError:
+    GDRIVE_AVAILABLE = False
+    def init_poller(*args, **kwargs): return None
+    def get_poller(): return None
+
 # API Router with /api prefix
 api_router = APIRouter(prefix="/api")
 
@@ -50,6 +59,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Constants
 MAX_PAGES_PER_CHUNK = 5  # Process 5 pages at a time to avoid GPU OOM
+GDRIVE_POLL_INTERVAL = int(os.environ.get('GDRIVE_POLL_INTERVAL', '60'))  # seconds
 
 # Global state
 app_data = {}
@@ -480,6 +490,94 @@ def save_job_to_history(job: dict, status: str, error_message: str = None,
     conn.commit()
     conn.close()
 
+    # Notify Google Drive integration if enabled
+    poller = get_poller()
+    if poller:
+        try:
+            poller.on_job_complete(
+                job_id=job["id"],
+                filename=job["filename"],
+                success=(status == "complete")
+            )
+        except Exception as e:
+            print(f"[GDrive] Error in on_job_complete: {e}")
+
+
+def add_file_to_queue_internal(filepath: str, filename: str, file_size: int) -> str:
+    """
+    Add a file to the queue programmatically (for Google Drive integration).
+
+    Args:
+        filepath: Local path to the file
+        filename: Original filename
+        file_size: File size in bytes
+
+    Returns:
+        job_id: The generated job ID
+    """
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+
+    # For Google Drive files: only output markdown (no images, no JSON)
+    # This keeps the output lightweight for upload back to Drive
+    job = {
+        "id": job_id,
+        "filename": filename,
+        "file_size": file_size,
+        "filepath": filepath,
+        "output_markdown": True,
+        "output_json": False,
+        "output_images": False,  # No images for GDrive - keeps it simple
+        "force_ocr": False,
+        "paginate_output": False,
+        "created_at": datetime.now().isoformat(),
+    }
+
+    # Add to queue
+    queue_state["jobs"].append(job)
+
+    # Save to queue table for persistence
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO queue (id, filename, file_size, filepath, output_markdown,
+                          output_json, output_images, force_ocr, paginate_output, created_at, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        job_id, filename, file_size, filepath,
+        job["output_markdown"], job["output_json"], job["output_images"],
+        job["force_ocr"], job["paginate_output"],
+        job["created_at"], len(queue_state["jobs"])
+    ))
+    conn.commit()
+    conn.close()
+
+    # Start processing if not already running (in background)
+    asyncio.create_task(process_queue())
+
+    return job_id
+
+
+async def gdrive_polling_task():
+    """Background task that polls Google Drive for new files."""
+    poller = get_poller()
+    if not poller:
+        return
+
+    print(f"[GDrive] Starting polling task (interval: {GDRIVE_POLL_INTERVAL}s)")
+
+    while True:
+        try:
+            # Poll and queue new files
+            job_ids = poller.poll_and_queue(add_file_to_queue_internal)
+            if job_ids:
+                print(f"[GDrive] Queued {len(job_ids)} new files")
+                await broadcast_queue_update()
+        except Exception as e:
+            print(f"[GDrive] Polling error: {e}")
+
+        await asyncio.sleep(GDRIVE_POLL_INTERVAL)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -488,7 +586,29 @@ async def lifespan(app: FastAPI):
     print("Loading marker models...")
     app_data["models"] = create_model_dict()
     print("Models loaded!")
+
+    # Initialize Google Drive integration if configured
+    gdrive_poller = init_poller(
+        db_path=DB_PATH,
+        upload_dir=UPLOAD_DIR,
+        output_dir=OUTPUT_DIR
+    )
+
+    # Start background polling task if enabled
+    polling_task = None
+    if gdrive_poller:
+        polling_task = asyncio.create_task(gdrive_polling_task())
+
     yield
+
+    # Cleanup
+    if polling_task:
+        polling_task.cancel()
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            pass
+
     if "models" in app_data:
         del app_data["models"]
 
@@ -665,6 +785,73 @@ async def queue_stream():
             queue_state["sse_clients"].discard(client_queue)
 
     return EventSourceResponse(event_generator())
+
+
+# --- Google Drive Endpoints ---
+
+@api_router.get("/gdrive/status")
+async def gdrive_status():
+    """Get Google Drive integration status."""
+    poller = get_poller()
+    if not poller:
+        return {
+            "enabled": False,
+            "message": "Google Drive integration not configured",
+            "poll_interval": GDRIVE_POLL_INTERVAL
+        }
+
+    return {
+        "enabled": True,
+        "poll_interval": GDRIVE_POLL_INTERVAL,
+        "upload_folder_id": poller.upload_folder_id,
+        "done_folder_id": poller.done_folder_id,
+    }
+
+
+@api_router.post("/gdrive/sync")
+async def gdrive_sync():
+    """Manually trigger a Google Drive sync."""
+    poller = get_poller()
+    if not poller:
+        raise HTTPException(
+            status_code=400,
+            detail="Google Drive integration not configured"
+        )
+
+    try:
+        job_ids = poller.poll_and_queue(add_file_to_queue_internal)
+        if job_ids:
+            await broadcast_queue_update()
+        return {
+            "status": "ok",
+            "files_queued": len(job_ids),
+            "job_ids": job_ids
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/gdrive/pending")
+async def gdrive_pending():
+    """List files waiting in Google Drive upload folder."""
+    poller = get_poller()
+    if not poller:
+        raise HTTPException(
+            status_code=400,
+            detail="Google Drive integration not configured"
+        )
+
+    try:
+        files = poller.list_new_files()
+        return {
+            "count": len(files),
+            "files": [
+                {"id": f["id"], "name": f["name"], "size": f.get("size", 0)}
+                for f in files
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- History Endpoints ---

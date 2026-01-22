@@ -179,3 +179,9 @@ cython_debug/
 .vscode/
 ib0600438engd.pdf
 nul
+
+# Google Cloud service account credentials (NEVER commit these)
+*-credentials.json
+gen-lang-client-*.json
+*serviceaccount*.json
+credentials.json
